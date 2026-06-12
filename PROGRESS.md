@@ -2,6 +2,34 @@
 
 Daily updates for review. Newest entry on top. Each entry states the day's goal, what was done, and how a reviewer can test it.
 
+## Day 3 — Thu, 11 Jun 2026
+
+**Goal:** Read events back out, and make webhook intake trustworthy with signature verification and request validation.
+
+**Done:**
+- `.env` auto-loaded at startup via `godotenv` (no more manual `export DATABASE_URL`); missing `.env` is non-fatal.
+- `GET /events` — lists events as JSON, with an optional `?status=` filter (parameterised query, no string concatenation). Returns `[]` (not `null`) when empty.
+- `GET /events/:id` — fetches one event via `QueryRow`; `404` when not found (`pgx.ErrNoRows`), `400` on a non-numeric id (parsed with `strconv`), full `payload` included.
+- HMAC-SHA256 signature verification on `POST /webhooks/:source` (`validateSignature` helper): hashes the raw body with the shared secret (`WEBHOOK_SECRET`), constant-time compare via `hmac.Equal`, `401` on mismatch/missing.
+- Request validation on intake: requires `Content-Type: application/json` (`400` otherwise) and caps the body at 1 MB via `http.MaxBytesReader`.
+
+**How to test:**
+1. Start the DB + run: `docker compose up -d && go run .` (DSN now comes from `.env`)
+2. Seed a valid signed event:
+   ```
+   BODY='{"id":"evt_v1","type":"push"}'
+   SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $2}')
+   curl -i -X POST localhost:8080/webhooks/github -H "Content-Type: application/json" -H "X-Signature-256: $SIG" -d "$BODY"
+   ```
+   → `202 stored`
+3. Wrong signature: same as above with `-H "X-Signature-256: deadbeef"` → `401 invalid signature`
+4. Wrong content-type: `curl -i -X POST localhost:8080/webhooks/github -d '{"id":"x"}'` → `400 invalid request`
+5. List: `curl -s localhost:8080/events` → JSON array; `curl -s "localhost:8080/events?status=delivered"` → `[]`
+6. Get one: `curl -s localhost:8080/events/1` → that row; `curl -s localhost:8080/events/9999` → `404 event not found`; `curl -s localhost:8080/events/abc` → `400 invalid id`
+
+**Next:** background delivery worker — pick due events (`status='received'`, `next_attempt_at <= now()`), POST to a destination, retry with backoff, mark `delivered`/`failed`/`dead`.
+**Blockers:** none. `WEBHOOK_SECRET` lives only in `.env` (gitignored) — anyone cloning must set their own.
+
 ## Day 2 — Wed, 10 Jun 2026
 
 **Goal:** Stand up PostgreSQL, connect from Go via pgx, create the `events` table, and accept + dedup incoming webhooks.
