@@ -2,6 +2,28 @@
 
 Daily updates for review. Newest entry on top. Each entry states the day's goal, what was done, and how a reviewer can test it.
 
+## Day 4 — Fri, 12 Jun 2026
+
+**Goal:** Actually *relay* — a background worker that picks up stored events, delivers them over HTTP, and retries failures with exponential backoff until they succeed or die.
+
+**Done:**
+- Background delivery worker (`startWorker`) — a goroutine started in `main()` (alongside the HTTP server), driven by a `time.Ticker` every 5s. Idle ticks are silent; DB errors are logged and the loop survives them.
+- Atomic job claim (`claimDueEvent`) — `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING …`. Grabs the oldest-due `received`/`failed` event, flips it to `processing`, and returns its payload — all in one statement so two workers can never grab the same row. `pgx.ErrNoRows` → `(nil, nil)` = "nothing due".
+- Delivery (`deliver`) — POSTs the payload to `DESTINATION_URL`. 2xx → `markDelivered`; transport error or non-2xx → `markFailed` (the real error/status is recorded in `last_error`).
+- Status state machine: `received`/`failed` → `processing` → `delivered`, or → `failed` (retry scheduled) → `dead` once `attempts >= max_attempts`.
+- Exponential backoff in `markFailed`: `next_attempt_at = now() + (2^attempts) seconds`, parameterised interval.
+- Local `POST /sink` route as a delivery target for offline end-to-end testing.
+
+**How to test:**
+1. `.env` has `DESTINATION_URL=http://localhost:8080/sink`. Start: `docker compose up -d && go run .`
+2. Happy path — make events claimable, then watch them deliver:
+   ```
+   docker compose exec -T db psql -U postgres -d webhook_relay -c "UPDATE events SET status='received', attempts=0, next_attempt_at=now();"
+   ```
+   → within ~5s/event the server logs `sink recieved …`; then `SELECT id, status, attempts FROM events;` shows all `delivered`, `attempts=0`.
+3. Failure path — point at a dead port (`DESTINATION_URL=http://localhost:9999/nope`), reset rows, restart:
+   → events go `failed`, `attempts` climbs each retry (backoff grows), `last_error` shows `connection refused`, and after 5 attempts → `dead`. Restore `.env` to `/sink` after.
+
 ## Day 3 — Thu, 11 Jun 2026
 
 **Goal:** Read events back out, and make webhook intake trustworthy with signature verification and request validation.

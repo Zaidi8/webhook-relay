@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -29,6 +31,14 @@ type Event struct {
 	Status        string    `json:"status"`
 	Attempts      int       `json:"attempts"`
 	CreatedAt     time.Time `json:"created_at"`
+}
+type EventWithPayload struct {
+	Id          int64  `json:"id"`
+	Source      string `json:"source"`
+	EventType   string `json:"event_type"`
+	Payload     []byte `json:"payload"`
+	Attempts    int    `json:"attempts"`
+	MaxAttempts int    `json:"max_attempts"`
 }
 
 func connectionPool(ctx context.Context) (*pgxpool.Pool, error) {
@@ -54,6 +64,82 @@ func validateSignature(secret string, body []byte, header string) bool {
 	}
 	return hmac.Equal(expected, received)
 
+}
+
+func claimDueEvent(ctx context.Context, pool *pgxpool.Pool) (*EventWithPayload, error) {
+	query := `UPDATE events SET status='processing',updated_at = now() 
+	WHERE id =(
+	SELECT id FROM events	
+	WHERE status IN ('received','failed')
+	AND next_attempt_at <= now()
+	ORDER BY next_attempt_at
+	FOR UPDATE SKIP LOCKED
+	LIMIT 1
+	)
+	RETURNING id, source, event_type, payload, attempts, max_attempts;
+	`
+
+	row := pool.QueryRow(ctx, query)
+	event := EventWithPayload{}
+	err := row.Scan(&event.Id, &event.Source, &event.EventType, &event.Payload, &event.Attempts, &event.MaxAttempts)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &event, nil
+}
+
+func markDelivered(ctx context.Context, pool *pgxpool.Pool, id int64) error {
+	query := `UPDATE events SET status='delivered', updated_at=now() WHERE id=$1`
+	_, err := pool.Exec(ctx, query, id)
+	return err
+}
+
+func markFailed(ctx context.Context, pool *pgxpool.Pool, ev *EventWithPayload, deliveryErr string) error {
+	newAttempts := ev.Attempts + 1
+	status := "failed"
+	query := `UPDATE events SET status=$1, attempts=$2, last_error=$3, next_attempt_at=now() + ($4 * interval '1 second'), updated_at=now() WHERE id=$5`
+	backoffSeconds := 1 << newAttempts
+	if newAttempts >= ev.MaxAttempts {
+		status = "dead"
+	}
+	_, err := pool.Exec(ctx, query, status, newAttempts, deliveryErr, backoffSeconds, ev.Id)
+	return err
+}
+
+func deliver(ctx context.Context, pool *pgxpool.Pool, ev *EventWithPayload) {
+	destURL := os.Getenv("DESTINATION_URL")
+	resp, err := http.Post(destURL, "application/json", bytes.NewReader(ev.Payload))
+	if err != nil {
+		markFailed(ctx, pool, ev, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		markDelivered(ctx, pool, ev.Id)
+		return
+	}
+	markFailed(ctx, pool, ev, fmt.Sprintf("got status %d", resp.StatusCode))
+
+}
+
+func startWorker(ctx context.Context, pool *pgxpool.Pool) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		event, err := claimDueEvent(ctx, pool)
+		if err != nil {
+			slog.Error("event not claimed", "error", err)
+			continue
+		}
+		if event == nil {
+			continue
+		}
+		deliver(ctx, pool, event)
+	}
 }
 
 func main() {
@@ -183,6 +269,14 @@ func main() {
 		return c.String(http.StatusAccepted, "stored")
 
 	})
+
+	e.POST("/sink", func(c *echo.Context) error {
+		body, _ := io.ReadAll(c.Request().Body)
+		slog.Info("sink recieved", "body", string(body))
+		return c.String(http.StatusOK, "ok")
+	})
+
+	go startWorker(ctx, pool)
 
 	if err := e.Start(":8080"); err != nil { // start listening (blocks)
 		slog.Error("failed to start server", "error", err)
