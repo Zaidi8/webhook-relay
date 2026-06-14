@@ -2,6 +2,23 @@
 
 Daily updates for review. Newest entry on top. Each entry states the day's goal, what was done, and how a reviewer can test it.
 
+## Day 6 — Sun, 14 Jun 2026
+
+**Goal:** Make the service production-shaped — survive being stopped, not hang on a slow destination, log its traffic — and document + test it.
+
+**Done:**
+- **Per-delivery HTTP timeout** — `deliver` now uses a shared package-level `*http.Client{Timeout: 10s}` instead of `http.Post` (whose default client has no timeout). A destination that accepts the connection but never responds now fails after 10s and retries on backoff, instead of freezing the worker forever.
+- **Graceful shutdown** — `signal.NotifyContext(SIGINT, SIGTERM)` provides one cancellable `ctx` that is the single off-switch. The server is started via Echo v5's `StartConfig{Address: ":8080"}.Start(ctx, e)` (v5 removed `e.Shutdown`; `StartConfig.Start` blocks and drains the server itself on ctx cancellation, default 10s `GracefulTimeout`). The worker watches the same `ctx`: its loop is now a `select` over `ticker.C` and `ctx.Done()`. A `sync.WaitGroup` (`Add(1)` before launch, `defer wg.Done()` in the worker, `wg.Wait()` after the server returns) makes `main()` wait for any in-flight delivery to finish before exiting — no abandoned `processing` rows.
+- **Request logging middleware** — `middleware.RequestLoggerWithConfig` wired to `slog`, emitting `method`, `uri`, `status`, `latency` per request (alongside the existing `middleware.Recover()`).
+- **README** — what the service is, architecture, endpoint table, prerequisites (Apple Silicon, check-before-install), setup, config, try-it examples, limitations.
+- **Tests** — `main_test.go`: `TestValidateSignature` (valid / wrong-sig / tampered-body / wrong-secret / non-hex-header) and `TestBackoffSeconds` (the `1 << attempts` math). `go test ./...` passes. `go mod tidy` promoted `coder/websocket` to a direct dependency.
+
+**How to test:**
+1. `go test ./...` → all pass.
+2. Graceful shutdown — `go run .`, queue some events (`docker compose exec -T db psql -U postgres -d webhook_relay -c "UPDATE events SET status='received', attempts=0, next_attempt_at=now();"`), then Ctrl-C → server stops, worker finishes in-flight work, logs `worker stopped, exiting`, clean exit (no panic). To witness the in-flight wait, temporarily add `time.Sleep(8s)` to the `/sink` handler and Ctrl-C mid-delivery.
+3. Timeout — point `DESTINATION_URL` at a host that accepts but never responds → delivery fails after ~10s with a timeout in `last_error`, then retries.
+4. Request logging — `curl -i localhost:8080/healthz` → server logs `request method=GET uri=/healthz status=200 latency=…`.
+
 ## Day 5 — Sat, 13 Jun 2026
 
 **Goal:** The real-time relay — clients connect over WebSocket as a user, and a message addressed to another user is routed live to that user's session via a hub. Plus the manual-retry endpoint outstanding from Day 4.

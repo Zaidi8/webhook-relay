@@ -13,8 +13,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -54,6 +56,8 @@ type Envelope struct {
 	To   string          `json:"to"`
 	Data json.RawMessage `json:"data"`
 }
+
+var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 func connectionPool(ctx context.Context) (*pgxpool.Pool, error) {
 	dbURL := os.Getenv("DATABASE_URL")
@@ -126,7 +130,7 @@ func markFailed(ctx context.Context, pool *pgxpool.Pool, ev *EventWithPayload, d
 
 func deliver(ctx context.Context, pool *pgxpool.Pool, ev *EventWithPayload) {
 	destURL := os.Getenv("DESTINATION_URL")
-	resp, err := http.Post(destURL, "application/json", bytes.NewReader(ev.Payload))
+	resp, err := httpClient.Post(destURL, "application/json", bytes.NewReader(ev.Payload))
 	if err != nil {
 		markFailed(ctx, pool, ev, err.Error())
 		return
@@ -140,19 +144,27 @@ func deliver(ctx context.Context, pool *pgxpool.Pool, ev *EventWithPayload) {
 
 }
 
-func startWorker(ctx context.Context, pool *pgxpool.Pool) {
+func startWorker(ctx context.Context, pool *pgxpool.Pool, wg *sync.WaitGroup) {
+	defer wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		event, err := claimDueEvent(ctx, pool)
-		if err != nil {
-			slog.Error("event not claimed", "error", err)
-			continue
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			event, err := claimDueEvent(ctx, pool)
+			if err != nil {
+				slog.Error("event not claimed", "error", err)
+				continue
+			}
+			if event == nil {
+				continue
+			}
+			deliver(ctx, pool, event)
+
 		}
-		if event == nil {
-			continue
-		}
-		deliver(ctx, pool, event)
+
 	}
 }
 
@@ -178,14 +190,14 @@ func (h *Hub) routeTo(user string, data []byte) {
 	default:
 	}
 }
-
 func main() {
 	hub := &Hub{conns: make(map[string]*client)}
 
 	if err := godotenv.Load(); err != nil {
 		slog.Error(".env file not found, relying on real environment", "error", err)
 	}
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	pool, err := connectionPool(ctx)
 	if err != nil {
 		slog.Warn("failed to connect to database", "error", err)
@@ -194,7 +206,22 @@ func main() {
 	defer pool.Close()
 	e := echo.New() // initialise the framework instance
 
-	e.Use(middleware.Recover()) // middleware: recover from panics
+	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+		LogMethod:  true,
+		LogURI:     true,
+		LogStatus:  true,
+		LogLatency: true,
+		LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
+			slog.Info(
+				"request",
+				"method", v.Method,
+				"uri", v.URI,
+				"status", v.Status,
+				"latency", v.Latency,
+			)
+			return nil
+		},
+	}))
 
 	e.GET("/healthz", func(c *echo.Context) error {
 		if err := pool.Ping(c.Request().Context()); err != nil {
@@ -369,11 +396,14 @@ func main() {
 		slog.Info("sink recieved", "body", string(body))
 		return c.String(http.StatusOK, "ok")
 	})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go startWorker(ctx, pool, &wg)
 
-	go startWorker(ctx, pool)
-
-	if err := e.Start(":8080"); err != nil { // start listening (blocks)
-		slog.Error("failed to start server", "error", err)
+	sc := echo.StartConfig{Address: ":8080"}
+	if err := sc.Start(ctx, e); err != nil && err != http.ErrServerClosed {
+		slog.Error("server err", "error", err)
 	}
-
+	wg.Wait()
+	slog.Info("worker stopped, existing")
 }
