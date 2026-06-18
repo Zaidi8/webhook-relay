@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"crypto/hmac"
@@ -7,8 +7,6 @@ import (
 	"testing"
 )
 
-// sign computes the hex-encoded HMAC-SHA256 of body with secret —
-// the same value a caller would put in the X-Signature-256 header.
 func sign(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
@@ -53,24 +51,4 @@ func TestValidateSignature(t *testing.T) {
 			t.Errorf("expected non-hex header to fail, got true")
 		}
 	})
-}
-
-func TestBackoffSeconds(t *testing.T) {
-	// Mirrors the backoff calculation used in markFailed: 1 << attempts.
-	cases := []struct {
-		attempts int
-		want     int
-	}{
-		{1, 2},
-		{2, 4},
-		{3, 8},
-		{4, 16},
-		{5, 32},
-	}
-	for _, c := range cases {
-		got := 1 << c.attempts
-		if got != c.want {
-			t.Errorf("backoff for attempts=%d: got %d, want %d", c.attempts, got, c.want)
-		}
-	}
 }
